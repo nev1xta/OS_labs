@@ -1,0 +1,489 @@
+\section{Исходная программа}
+
+{\bfseries systemCall.cpp} 
+
+\begin{lstlisting}[language=C++]
+#include "systemCall.h"
+#include <iostream>
+
+#ifdef _WIN32
+#include <tchar.h>
+#endif
+
+bool PipeCreate(pipeT* pipe) {
+    if (!pipe) {
+        return false;
+    }
+
+#ifdef _WIN32
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = NULL;
+
+    if (!CreatePipe(&pipe->read_end, &pipe->write_end, &sa, 0)) {
+        return false;
+    }
+    
+    return true;
+#else
+    int fds[2];
+    if (::pipe(fds) == -1) {
+        return false;
+    }
+    pipe_ptr->read_end = fds[0];
+    pipe_ptr->write_end = fds[1];
+    return true;
+#endif
+}
+
+void PipeClose(pipeT* pipe) {
+    if (!pipe) {
+        return;
+    }
+
+#ifdef _WIN32
+    if (pipe->read_end != INVALID_PIPE_HANDLE) {
+        CloseHandle(pipe->read_end);
+        pipe->read_end = INVALID_PIPE_HANDLE;
+    }
+    if (pipe->write_end != INVALID_PIPE_HANDLE) {
+        CloseHandle(pipe->write_end);
+        pipe->write_end = INVALID_PIPE_HANDLE;
+    }
+#else
+    if (pipe->read_end != INVALID_PIPE_HANDLE) {
+        close(pipe->read_end);
+        pipe->read_end = INVALID_PIPE_HANDLE;
+    }
+    if (pipe->write_end != INVALID_PIPE_HANDLE) {
+        close(pipe->write_end);
+        pipe->write_end = INVALID_PIPE_HANDLE;
+    }
+#endif
+}
+
+void PipeCloseWriteEnd(pipeT* pipe) {
+    if (!pipe) {
+        return;
+    }
+
+#ifdef _WIN32
+    if (pipe->write_end != INVALID_PIPE_HANDLE) {
+        CloseHandle(pipe->write_end);
+        pipe->write_end = INVALID_PIPE_HANDLE;
+    }
+#else
+    if (pipe->write_end != INVALID_PIPE_HANDLE) {
+        close(pipe->write_end);
+        pipe->write_end = INVALID_PIPE_HANDLE;
+    }
+#endif
+}
+
+process ProcessCreate(const char* program, pipeT* stdin_pipe, pipeT* stdout_pipe) {
+    process process_info;
+    process_info.is_valid = false;
+
+#ifdef _WIN32
+    STARTUPINFOA si;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    
+    si.hStdInput = stdin_pipe ? stdin_pipe->read_end : GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = stdout_pipe ? stdout_pipe->write_end : GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&pi, sizeof(pi));
+
+    if (CreateProcessA(NULL, (LPSTR)program, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        process_info.process_info = pi;
+        process_info.is_valid = true;
+        CloseHandle(pi.hThread);
+    }
+#else
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (stdin_pipe) {
+            dup2(stdin_pipe->read_end, STDIN_FILENO);
+            close(stdin_pipe->read_end);
+            close(stdin_pipe->write_end);
+        }
+        if (stdout_pipe) {
+            dup2(stdout_pipe->write_end, STDOUT_FILENO);
+            close(stdout_pipe->read_end);
+            close(stdout_pipe->write_end);
+        }
+        
+        execl(program, program, NULL);
+        exit(1);
+    } else if (pid > 0) {
+        if (stdin_pipe) {
+            close(stdin_pipe->read_end);  
+        }
+        if (stdout_pipe) {
+            close(stdout_pipe->write_end); 
+        }
+        
+        process_info.pid = pid;
+        process_info.is_valid = true;
+    }
+#endif
+
+    return process_info;
+}
+
+int ProcessTerminate(process* process_info) {
+    if (!process_info || !process_info->is_valid) {
+        return 0;
+    }
+
+#ifdef _WIN32
+    TerminateProcess(process_info->process_info.hProcess, 0);
+    CloseHandle(process_info->process_info.hProcess);
+    return 0;
+#else
+    kill(process_info->pid, SIGTERM);
+        return 0;
+#endif
+    process_info->is_valid = false;
+    return 1;
+}
+
+bool ReadStringFromPipe(PIPE_HANDLE pipe, std::string& output) {
+    char buffer[1024];
+    
+#ifdef _WIN32
+    DWORD bytes_read;
+    if (ReadFile(pipe, buffer, sizeof(buffer) - 1, &bytes_read, NULL) && bytes_read > 0) {
+        buffer[bytes_read] = '\0';
+        output = buffer;
+        return true;
+    }
+#else
+    ssize_t bytes_read = read(pipe, buffer, sizeof(buffer) - 1);
+    if (bytes_read > 0) {
+        buffer[bytes_read] = '\0';
+        output = buffer;
+        return true;
+    }
+#endif
+    
+    return false;
+}
+
+bool WriteStringToPipe(PIPE_HANDLE pipe, const std::string& input) {
+    if (input.empty()) {
+        return true;
+    }
+    
+#ifdef _WIN32
+    DWORD bytes_written;
+    return WriteFile(pipe, input.c_str(), input.length(), &bytes_written, NULL) && 
+           bytes_written == input.length();
+#else
+    ssize_t bytes_written = write(pipe, input.c_str(), input.length());
+    return bytes_written == (ssize_t)input.length();
+#endif
+}
+\end{lstlisting}
+
+{\bfseries systemCall.h} 
+
+\begin{lstlisting}[language=C++]
+#ifndef SYSTEMCALL_H
+#define SYSTEMCALL_H
+
+#include <string>
+
+#ifdef _WIN32
+    #include <windows.h>
+    #define PIPE_HANDLE HANDLE
+    #define INVALID_PIPE_HANDLE INVALID_HANDLE_VALUE
+#else
+    #include <unistd.h>
+    #include <sys/wait.h>
+    #define PIPE_HANDLE int
+    #define INVALID_PIPE_HANDLE -1
+#endif
+
+typedef struct {
+    PIPE_HANDLE read_end;
+    PIPE_HANDLE write_end;
+} pipeT;
+
+typedef struct {
+#ifdef _WIN32
+    PROCESS_INFORMATION process_info;
+#else
+    pid_t pid;
+#endif
+    bool is_valid;
+} process;
+
+bool PipeCreate(pipeT* pipe);
+void PipeClose(pipeT* pipe);
+void PipeCloseWriteEnd(pipeT* pipe);
+
+process ProcessCreate(const char* program, pipeT* stdin_pipe, pipeT* stdout_pipe);
+int ProcessTerminate(process* process_info);
+
+bool ReadStringFromPipe(PIPE_HANDLE pipe, std::string& output);
+bool WriteStringToPipe(PIPE_HANDLE pipe, const std::string& input);
+
+#endif
+\end{lstlisting}
+
+{\bfseries parent.cpp} 
+
+\begin{lstlisting}[language=C++]
+#include "systemCall.h"
+#include <iostream>
+#include <string>
+
+int main() {
+    pipeT pipe1, pipe2, pipe3;
+    process child1, child2;
+    
+    pipe1.read_end = INVALID_PIPE_HANDLE;
+    pipe1.write_end = INVALID_PIPE_HANDLE;
+    pipe2.read_end = INVALID_PIPE_HANDLE;
+    pipe2.write_end = INVALID_PIPE_HANDLE;
+    pipe3.read_end = INVALID_PIPE_HANDLE;
+    pipe3.write_end = INVALID_PIPE_HANDLE;
+    
+    std::cout << "Creating pipes and processes..." << std::endl;
+    
+    if (!PipeCreate(&pipe1) || !PipeCreate(&pipe2) || !PipeCreate(&pipe3)) {
+        std::cerr << "Failed to create pipes" << std::endl;
+        return 1;
+    }
+
+    #ifdef _WIN32
+        child1 = ProcessCreate("child1.exe", &pipe1, &pipe2);
+        child2 = ProcessCreate("child2.exe", &pipe2, &pipe3);
+#   else
+        child1 = ProcessCreate("./child1", &pipe1, &pipe2);
+        child2 = ProcessCreate("./child2", &pipe2, &pipe3);
+    #endif
+    
+    if (!child1.is_valid || !child2.is_valid) {
+        std::cerr << "Failed to create child processes" << std::endl;
+        PipeClose(&pipe1);
+        PipeClose(&pipe2);
+        PipeClose(&pipe3);
+        return 1;
+    }
+    
+    std::cout << "Ready. Enter strings (empty line to exit):" << std::endl;
+    
+    std::string input;
+    while (true) {
+        std::cout << "> ";
+        std::getline(std::cin, input);
+        
+        if (input.empty()) {
+            break;
+        }
+
+        if (WriteStringToPipe(pipe1.write_end, input + "\n")) {
+            // читаем из pipe3
+            std::string result;
+            if (ReadStringFromPipe(pipe3.read_end, result)) {
+                std::cout << "Result: " << result;
+            } else {
+                std::cerr << "Failed to read result" << std::endl;
+                break;
+            }
+        } else {
+            std::cerr << "Failed to send data" << std::endl;
+            break;
+        }
+    }
+    
+    std::cout << "Program is ending..." << std::endl;
+    
+    PipeCloseWriteEnd(&pipe1);
+    PipeCloseWriteEnd(&pipe2);
+    PipeCloseWriteEnd(&pipe3);
+    
+    if (child1.is_valid) {
+        std::cout << "exit_code for child1 -- " << ProcessTerminate(&child1) << std::endl;
+    }
+    if (child2.is_valid) {
+        std::cout << "exit_code for child2 -- " << ProcessTerminate(&child2) << std::endl;
+    }
+    
+    PipeClose(&pipe1);
+    PipeClose(&pipe2);
+    PipeClose(&pipe3);
+    
+    std::cout << "Program finished" << std::endl;
+    return 0;
+}
+\end{lstlisting}
+
+{\bfseries child1.cpp} 
+
+\begin{lstlisting}[language=C++]
+#include <iostream>
+#include <string>
+#include <algorithm>
+#include <cctype>
+
+int main() {
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        for (char& c : line) {
+            c = std::tolower(c);
+        }
+        std::cout << line << std::endl;
+    }
+    return 0;
+}
+\end{lstlisting}
+
+{\bfseries child2.cpp} 
+
+\begin{lstlisting}[language=C++]
+int main() {
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        std::string result;
+        bool prev_space = false;
+        
+        for (char c : line) {
+            if (std::isspace(c)) {
+                if (!prev_space) {
+                    result += c;
+                    prev_space = true;
+                }
+            } else {
+                result += c;
+                prev_space = false;
+            }
+        }
+        std::cout << result << std::endl;
+    }
+    return 0;
+}
+\end{lstlisting}
+
+{\bfseries Запуск на Linux вывод strace} 
+
+\begin{verbatim}
+ksenomorf@ksenVM:~/lab1OS/build/bin$ strace ./parent
+execve("./parent", ["./parent"], 0x7ffc2dfadb80 /* 82 vars */) = 0
+brk(NULL)                               = 0x5ff53dada000
+arch_prctl(0x3001 /* ARCH_??? */, 0x7fff6c1d1b40) = -1 EINVAL (Недопустимый аргумент)
+mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x75648c107000
+access("/etc/ld.so.preload", R_OK)      = -1 ENOENT (Нет такого файла или каталога)
+openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
+newfstatat(3, "", {st_mode=S_IFREG|0644, st_size=62143, ...}, AT_EMPTY_PATH) = 0
+mmap(NULL, 62143, PROT_READ, MAP_PRIVATE, 3, 0) = 0x75648c0f7000
+close(3)                                = 0
+openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libstdc++.so.6", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\0\0\0\0\0\0\0\0"..., 832) = 832
+newfstatat(3, "", {st_mode=S_IFREG|0644, st_size=2260296, ...}, AT_EMPTY_PATH) = 0
+mmap(NULL, 2275520, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x75648be00000
+mprotect(0x75648be9a000, 1576960, PROT_NONE) = 0
+mmap(0x75648be9a000, 1118208, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x9a000) = 0x75648be9a000
+mmap(0x75648bfab000, 454656, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1ab000) = 0x75648bfab000
+mmap(0x75648c01b000, 57344, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x21a000) = 0x75648c01b000
+mmap(0x75648c029000, 10432, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) = 0x75648c029000
+close(3)                                = 0
+openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libgcc_s.so.1", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\0\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\0\0\0\0\0\0\0\0"..., 832) = 832
+newfstatat(3, "", {st_mode=S_IFREG|0644, st_size=125488, ...}, AT_EMPTY_PATH) = 0
+mmap(NULL, 127720, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x75648c0d7000
+mmap(0x75648c0da000, 94208, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x3000) = 0x75648c0da000
+mmap(0x75648c0f1000, 16384, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1a000) = 0x75648c0f1000
+mmap(0x75648c0f5000, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1d000) = 0x75648c0f5000
+close(3)                                = 0
+openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libc.so.6", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0P\237\2\0\0\0\0\0"..., 832) = 832
+pread64(3, "\6\0\0\0\4\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0"..., 784, 64) = 784
+pread64(3, "\4\0\0\0 \0\0\0\5\0\0\0GNU\0\2\0\0\300\4\0\0\0\3\0\0\0\0\0\0\0"..., 48, 848) = 48
+pread64(3, "\4\0\0\0\24\0\0\0\3\0\0\0GNU\0O{\f\225\\=\201\327\312\301P\32$\230\266\235"..., 68, 896) = 68
+newfstatat(3, "", {st_mode=S_IFREG|0755, st_size=2220400, ...}, AT_EMPTY_PATH) = 0
+pread64(3, "\6\0\0\0\4\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0@\0\0\0\0\0\0\0"..., 784, 64) = 784
+mmap(NULL, 2264656, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x75648ba00000
+mprotect(0x75648ba28000, 2023424, PROT_NONE) = 0
+mmap(0x75648ba28000, 1658880, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x28000) = 0x75648ba28000
+mmap(0x75648bbbd000, 360448, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x1bd000) = 0x75648bbbd000
+mmap(0x75648bc16000, 24576, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x215000) = 0x75648bc16000
+mmap(0x75648bc1c000, 52816, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) = 0x75648bc1c000
+close(3)                                = 0
+openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libm.so.6", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0\3\0>\0\1\0\0\0\0\0\0\0\0\0\0\0"..., 832) = 832
+newfstatat(3, "", {st_mode=S_IFREG|0644, st_size=940560, ...}, AT_EMPTY_PATH) = 0
+mmap(NULL, 942344, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x75648bd19000
+mmap(0x75648bd27000, 507904, PROT_READ|PROT_EXEC, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0xe000) = 0x75648bd27000
+mmap(0x75648bda3000, 372736, PROT_READ, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0x8a000) = 0x75648bda3000
+mmap(0x75648bdfe000, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_DENYWRITE, 3, 0xe4000) = 0x75648bdfe000
+close(3)                                = 0
+mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x75648c0d5000
+arch_prctl(ARCH_SET_FS, 0x75648c0d63c0) = 0
+set_tid_address(0x75648c0d6690)         = 3889
+set_robust_list(0x75648c0d66a0, 24)     = 0
+rseq(0x75648c0d6d60, 0x20, 0, 0x53053053) = 0
+mprotect(0x75648bc16000, 16384, PROT_READ) = 0
+mprotect(0x75648bdfe000, 4096, PROT_READ) = 0
+mprotect(0x75648c0f5000, 4096, PROT_READ) = 0
+mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x75648c0d3000
+mprotect(0x75648c01b000, 45056, PROT_READ) = 0
+mprotect(0x5ff5071d2000, 4096, PROT_READ) = 0
+mprotect(0x75648c141000, 8192, PROT_READ) = 0
+prlimit64(0, RLIMIT_STACK, NULL, {rlim_cur=8192*1024, rlim_max=RLIM64_INFINITY}) = 0
+munmap(0x75648c0f7000, 62143)           = 0
+getrandom("\x4c\x29\xee\xf2\xde\xe2\xf6\x4e", 8, GRND_NONBLOCK) = 8
+brk(NULL)                               = 0x5ff53dada000
+brk(0x5ff53dafb000)                     = 0x5ff53dafb000
+futex(0x75648c02977c, FUTEX_WAKE_PRIVATE, 2147483647) = 0
+newfstatat(1, "", {st_mode=S_IFCHR|0620, st_rdev=makedev(0x88, 0), ...}, AT_EMPTY_PATH) = 0
+write(1, "Creating pipes and processes...\n", 32Creating pipes and processes...
+) = 32
+pipe2([3, 4], 0)                        = 0
+pipe2([5, 6], 0)                        = 0
+pipe2([7, 8], 0)                        = 0
+clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x75648c0d6690) = 3890
+close(3)                                = 0
+close(6)                                = 0
+clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x75648c0d6690) = 3891
+close(5)                                = 0
+close(8)                                = 0
+write(1, "Ready. Enter strings (empty line"..., 43Ready. Enter strings (empty line to exit):
+) = 43
+write(1, "> ", 2> )                       = 2
+newfstatat(0, "", {st_mode=S_IFCHR|0620, st_rdev=makedev(0x88, 0), ...}, AT_EMPTY_PATH) = 0
+read(0, AAAA    NNN      89887
+"AAAA    NNN      89887\n", 1024) = 23
+write(4, "AAAA    NNN      89887\n", 23) = 23
+read(7, "aaaa nnn 89887\n", 1023)       = 15
+write(1, "Result: aaaa nnn 89887\n", 23Result: aaaa nnn 89887
+) = 23
+write(1, "> ", 2> )                       = 2
+read(0, 
+"\n", 1024)                     = 1
+write(1, "Program is ending...\n", 21Program is ending...
+)  = 21
+close(4)                                = 0
+close(6)                                = -1 EBADF (Неправильный дескриптор файла)
+close(8)                                = -1 EBADF (Неправильный дескриптор файла)
+kill(3890, SIGTERM)                     = 0
+--- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_KILLED, si_pid=3890, si_uid=1000, si_status=SIGTERM, si_utime=0, si_stime=0} ---
+write(1, "exit_code for child1 -- 0\n", 26exit_code for child1 -- 0
+) = 26
+kill(3891, SIGTERM)                     = 0
+write(1, "exit_code for child2 -- 0\n", 26exit_code for child2 -- 0
+) = 26
+close(3)                                = -1 EBADF (Неправильный дескриптор файла)
+close(5)                                = -1 EBADF (Неправильный дескриптор файла)
+close(7)                                = 0
+write(1, "Program finished\n", 17Program finished
+)      = 17
+exit_group(0)                           = ?
++++ exited with 0 +++
+\end{verbatim}
